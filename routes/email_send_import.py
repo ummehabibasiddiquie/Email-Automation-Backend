@@ -373,7 +373,7 @@ def upload_email_send_file():
         conn.commit()
 
         return api_response(
-            "Imported successfully (dedupe=sender+receiver+sent_at, selective update)",
+            "Imported successfully",
             200,
             {
                 "inserted": inserted,
