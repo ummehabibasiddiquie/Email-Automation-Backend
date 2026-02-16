@@ -17,7 +17,13 @@ app.register_blueprint(email_send_import_bp, url_prefix="/email_send_import")
 
 # CORS(app, supports_credentials=True)
 # CORS(app, resources={r"/*": {"origins": "*"}})
-CORS(app, resources={r"/*": {"origins": ["https://email-automation-dashboard-maox.vercel.app", "https://email-file-sending.vercel.app", "https://email-dashboard-goly.vercel.app", "https://email-file-goly.vercel.app"]}})
+CORS(app, resources={r"/*": {"origins": ["https://email-automation-dashboard-maox.vercel.app", 
+                                         "https://email-file-sending.vercel.app", 
+                                         "https://email-dashboard-goly.vercel.app", 
+                                         "https://email-file-goly.vercel.app", 
+                                         "https://www.golyyield.com",
+                                         "https://www.mplyetf.com"]}})
+
 
 @app.get("/")
 def root():
