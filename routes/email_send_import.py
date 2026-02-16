@@ -2,6 +2,7 @@
 
 import os
 import re
+import hashlib
 from datetime import datetime
 from flask import Blueprint, request
 import pandas as pd
@@ -23,16 +24,17 @@ EXPECTED_HEADERS = [
     "Body",
 ]
 
-
+# =========================
+# DB + helpers
+# =========================
 def get_db_connection():
-    # Uses same DB config pattern as your email_tracking script
     return mysql.connector.connect(
         host=Config.TRACK_DB_HOST,
         user=Config.TRACK_DB_USER,
         password=Config.TRACK_DB_PASS,
         database=Config.TRACK_DB_NAME,
         port=Config.TRACK_DB_PORT,
-        use_pure=True,  # helps avoid named-pipe behavior on Windows
+        use_pure=True,
     )
 
 
@@ -46,6 +48,11 @@ def normalize_header(h: str) -> str:
 
 def norm_email(val: str) -> str:
     return (val or "").strip().lower()
+
+
+def norm_text(val: str):
+    s = (val or "").strip()
+    return s if s else None
 
 
 def parse_sent_at(val):
@@ -85,18 +92,46 @@ def parse_sent_at(val):
         return None
 
 
+# ✅ DEDUPE IDENTITY (UPDATED):
+# Only sender + receiver + sent_at (subject/body/responds can change and will UPDATE)
+def make_dedupe_key(sender: str, receiver: str, sent_at: datetime) -> str | None:
+    if not sent_at:
+        return None  # cannot dedupe safely without sent_at
+
+    sent = sent_at.strftime("%Y-%m-%d %H:%M:%S")
+    raw = "|".join(
+        [
+            (sender or "").strip().lower(),
+            (receiver or "").strip().lower(),
+            sent,
+        ]
+    )
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+# =========================
+# Upload API
+# =========================
 @email_send_import_bp.route("/upload", methods=["POST"])
 def upload_email_send_file():
     """
     POST multipart/form-data
       - file: .xlsx/.xls/.csv
 
-    Inserts into:
-      email_send_logs
+    Requires DB change:
+      email_send_logs must include:
+        - dedupe_key VARCHAR(32)
+        - UNIQUE INDEX on dedupe_key
 
-    Also checks:
-      email_subscription_preferences (sender_email, receiver_email)
-      If exists and is_subscribed = 0 -> responds = 'Unsubscribed'
+    Behavior:
+      - Identity = sender + receiver + sent_at
+      - If same identity exists:
+          - If any allowed fields changed -> UPDATE
+          - Else -> count as duplicate (no update)
+      - If not exists -> INSERT
+      - Unsubscribe override:
+          if email_subscription_preferences.is_subscribed = 0
+          -> Responds='Unsubscribed'
     """
     if "file" not in request.files:
         return api_response("Missing file in form-data with key 'file'", 400)
@@ -121,10 +156,8 @@ def upload_email_send_file():
         else:
             return api_response("Unsupported file type. Upload .xlsx or .csv", 400)
 
-        # Normalize headers
         df.columns = [normalize_header(c) for c in df.columns]
 
-        # Validate headers
         missing = [h for h in EXPECTED_HEADERS if h not in df.columns]
         extra = [c for c in df.columns if c not in EXPECTED_HEADERS]
         if missing:
@@ -134,7 +167,6 @@ def upload_email_send_file():
                 {"missing_headers": missing, "extra_headers": extra, "expected": EXPECTED_HEADERS},
             )
 
-        # Keep expected cols
         df = df[EXPECTED_HEADERS].copy().fillna("")
 
         # --------------------
@@ -143,13 +175,18 @@ def upload_email_send_file():
         conn = get_db_connection()
         cur = conn.cursor(dictionary=True)
 
-        rows = []
         skipped = 0
+        inserted = 0
+        updated = 0
+        duplicates_no_change = 0
         unsubscribed_override_count = 0
 
         # --------------------
-        # Build insert rows
+        # Build candidates + dedupe keys
         # --------------------
+        candidates = []
+        dedupe_keys = []
+
         for _, r in df.iterrows():
             sender_email = norm_email(r["Sender Email"])
             receiver_email = norm_email(r["Receiver Email"])
@@ -158,9 +195,22 @@ def upload_email_send_file():
                 skipped += 1
                 continue
 
-            responds_value = (r["Responds"] or "").strip()
+            first_name = norm_text(r["First Name"])
+            company = norm_text(r["Company"])
+            status = norm_text(r["Status"])
+            status_message = norm_text(r["StatusMessage"])
+            sent_at = parse_sent_at(r["SentAt"])
+            subject = norm_text(r["Subject"])
+            body = norm_text(r["Body"])
+            responds_value = (r["Responds"] or "").strip() or None
 
-            # ✅ Unsubscribe check (normalized on both DB + input)
+            # ✅ Need sent_at for stable dedupe
+            dkey = make_dedupe_key(sender_email, receiver_email, sent_at)
+            if not dkey:
+                skipped += 1
+                continue
+
+            # ✅ Unsubscribe override
             cur.execute(
                 """
                 SELECT is_subscribed
@@ -173,52 +223,176 @@ def upload_email_send_file():
                 (sender_email, receiver_email),
             )
             pref = cur.fetchone()
-
             if pref and str(pref.get("is_subscribed")) == "0":
                 responds_value = "Unsubscribed"
                 unsubscribed_override_count += 1
 
-            rows.append(
+            candidates.append(
+                {
+                    "dedupe_key": dkey,
+                    "sender_email": sender_email,
+                    "receiver_email": receiver_email,
+                    "first_name": first_name,
+                    "company": company,
+                    "status": status,
+                    "status_message": status_message,
+                    "sent_at": sent_at,
+                    "responds": responds_value,
+                    "subject": subject,
+                    "body": body,
+                }
+            )
+            dedupe_keys.append(dkey)
+
+        if not candidates:
+            return api_response(
+                "No valid rows found to insert/update (SentAt missing?)",
+                400,
+                {"skipped": skipped},
+            )
+
+        # --------------------
+        # Fetch existing rows by dedupe_key (chunked)
+        # --------------------
+        existing_map = {}  # dedupe_key -> existing row
+        CHUNK = 500
+
+        for i in range(0, len(dedupe_keys), CHUNK):
+            chunk = dedupe_keys[i : i + CHUNK]
+            placeholders = ",".join(["%s"] * len(chunk))
+            cur.execute(
+                f"""
+                SELECT id, dedupe_key, first_name, company, responds, status, status_message, subject, body
+                FROM email_send_logs
+                WHERE dedupe_key IN ({placeholders})
+                """,
+                chunk,
+            )
+            for row in cur.fetchall():
+                existing_map[row["dedupe_key"]] = row
+
+        # --------------------
+        # Decide insert vs update vs duplicate(no change)
+        # --------------------
+        insert_rows = []
+        update_rows = []
+
+        def same(a, b):
+            return (a or None) == (b or None)
+
+        for c in candidates:
+            ex = existing_map.get(c["dedupe_key"])
+
+            if not ex:
+                insert_rows.append(
+                    (
+                        c["sender_email"],
+                        c["receiver_email"],
+                        c["first_name"],
+                        c["company"],
+                        c["status"],
+                        c["status_message"],
+                        c["sent_at"],
+                        c["responds"],
+                        c["subject"],
+                        c["body"],
+                        c["dedupe_key"],
+                    )
+                )
+                continue
+
+            # ✅ Allowed updates: responds + subject + body + status + status_message (+ optional first_name/company)
+            changed = False
+
+            if not same(ex.get("responds"), c["responds"]):
+                changed = True
+            if not same(ex.get("status"), c["status"]):
+                changed = True
+            if not same(ex.get("status_message"), c["status_message"]):
+                changed = True
+            if not same(ex.get("subject"), c["subject"]):
+                changed = True
+            if not same(ex.get("body"), c["body"]):
+                changed = True
+
+            # Optional: also update these if you want
+            if not same(ex.get("first_name"), c["first_name"]):
+                changed = True
+            if not same(ex.get("company"), c["company"]):
+                changed = True
+
+            if not changed:
+                duplicates_no_change += 1
+                continue
+
+            update_rows.append(
                 (
-                    sender_email,
-                    receiver_email,
-                    (r["First Name"] or "").strip() or None,
-                    (r["Company"] or "").strip() or None,
-                    (r["Status"] or "").strip() or None,
-                    (r["StatusMessage"] or "").strip() or None,
-                    parse_sent_at(r["SentAt"]),
-                    responds_value or None,
-                    (r["Subject"] or "").strip() or None,
-                    (r["Body"] or "").strip() or None,
+                    c["first_name"],
+                    c["company"],
+                    c["status"],
+                    c["status_message"],
+                    c["responds"],
+                    c["subject"],
+                    c["body"],
+                    int(ex["id"]),
                 )
             )
 
-        if not rows:
-            return api_response("No valid rows found to insert", 400, {"skipped": skipped})
-
         # --------------------
-        # Insert into DB
+        # Execute DB writes
         # --------------------
-        insert_sql = """
-            INSERT INTO email_send_logs
-            (sender_email, receiver_email, first_name, company, status, status_message,
-             sent_at, responds, subject, body)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """
+        if insert_rows:
+            cur.executemany(
+                """
+                INSERT INTO email_send_logs
+                (sender_email, receiver_email, first_name, company, status, status_message,
+                 sent_at, responds, subject, body, dedupe_key)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                insert_rows,
+            )
+            inserted = cur.rowcount
 
-        cur.executemany(insert_sql, rows)
+        if update_rows:
+            cur.executemany(
+                """
+                UPDATE email_send_logs
+                SET first_name=%s,
+                    company=%s,
+                    status=%s,
+                    status_message=%s,
+                    responds=%s,
+                    subject=%s,
+                    body=%s
+                WHERE id=%s
+                """,
+                update_rows,
+            )
+            updated = cur.rowcount
+
         conn.commit()
 
         return api_response(
-            "Imported successfully",
+            "Imported successfully (dedupe=sender+receiver+sent_at, selective update)",
             200,
             {
-                "inserted": cur.rowcount,
+                "inserted": inserted,
+                "updated": updated,
+                "duplicates_no_change": duplicates_no_change,
                 "skipped": skipped,
                 "total_rows_in_file": int(len(df)),
                 "unsubscribed_overrides": unsubscribed_override_count,
             },
         )
+
+    except mysql.connector.IntegrityError as ie:
+        # In case unique index exists and concurrent insert happens
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return api_response(f"Import failed (duplicate key): {str(ie)}", 409)
 
     except Exception as e:
         try:
@@ -240,13 +414,17 @@ def upload_email_send_file():
         except Exception:
             pass
 
+
+# =========================
+# List API
+# =========================
 @email_send_import_bp.route("/list", methods=["POST"])
 def list_email_logs():
     data = request.get_json(silent=True) or {}
 
     page = int(data.get("page", 1))
     per_page = int(data.get("per_page", 10))
-    date_val = (data.get("date") or "").strip()  # ✅ single date: YYYY-MM-DD
+    date_val = (data.get("date") or "").strip()  # single date: YYYY-MM-DD
     sender_email = (data.get("sender_email") or "").strip().lower()
     receiver_email = (data.get("receiver_email") or "").strip().lower()
 
@@ -267,7 +445,6 @@ def list_email_logs():
         where_clauses = []
         params = []
 
-        # ✅ Single date filter
         if date_val:
             where_clauses.append("DATE(sent_at) = %s")
             params.append(date_val)
@@ -282,12 +459,10 @@ def list_email_logs():
 
         where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
-        # Total count
         count_sql = f"SELECT COUNT(*) AS total FROM email_send_logs {where_sql}"
         cur.execute(count_sql, params)
         total_records = int(cur.fetchone()["total"])
 
-        # Data
         data_sql = f"""
             SELECT *
             FROM email_send_logs
