@@ -1,5 +1,3 @@
-# routes/email_send_import.py
-
 import os
 import re
 import hashlib
@@ -37,34 +35,27 @@ def get_db_connection():
         use_pure=True,
     )
 
-
 def api_response(message, status=200, data=None):
     return {"message": message, "status": status, "data": data or {}}, status
-
 
 def normalize_header(h: str) -> str:
     return re.sub(r"\s+", " ", (h or "").strip())
 
-
 def norm_email(val: str) -> str:
     return (val or "").strip().lower()
-
 
 def norm_text(val: str):
     s = (val or "").strip()
     return s if s else None
 
-
 def parse_sent_at(val):
     if val is None:
         return None
-
     try:
         if pd.isna(val):
             return None
     except Exception:
         pass
-
     if isinstance(val, datetime):
         return val
 
@@ -91,23 +82,32 @@ def parse_sent_at(val):
     except Exception:
         return None
 
+def is_real_response(responds: str | None) -> bool:
+    """
+    Treat these as NOT a real response:
+      - None / empty
+      - 'No Response Yet' (your file default)
+    Everything else counts as response (including 'Unsubscribed')
+    """
+    if not responds:
+        return False
+    v = responds.strip().lower()
+    return v not in ("", "no response yet")
 
-# ✅ DEDUPE IDENTITY (UPDATED):
-# Only sender + receiver + sent_at (subject/body/responds can change and will UPDATE)
-def make_dedupe_key(sender: str, receiver: str, sent_at: datetime) -> str | None:
+# =========================
+# DEDUPE (includes email_type)
+# =========================
+def make_dedupe_key(sender: str, receiver: str, sent_at: datetime, email_type: str):
     if not sent_at:
-        return None  # cannot dedupe safely without sent_at
-
+        return None
     sent = sent_at.strftime("%Y-%m-%d %H:%M:%S")
-    raw = "|".join(
-        [
-            (sender or "").strip().lower(),
-            (receiver or "").strip().lower(),
-            sent,
-        ]
-    )
+    raw = "|".join([
+        (sender or "").strip().lower(),
+        (receiver or "").strip().lower(),
+        (email_type or "").strip().upper(),
+        sent,
+    ])
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
-
 
 # =========================
 # Upload API
@@ -115,40 +115,37 @@ def make_dedupe_key(sender: str, receiver: str, sent_at: datetime) -> str | None
 @email_send_import_bp.route("/upload", methods=["POST"])
 def upload_email_send_file():
     """
-    POST multipart/form-data
+    POST multipart/form-data:
       - file: .xlsx/.xls/.csv
-
-    Requires DB change:
-      email_send_logs must include:
-        - dedupe_key VARCHAR(32)
-        - UNIQUE INDEX on dedupe_key
+      - email_type: GOLY | MPLY   (from dropdown)
 
     Behavior:
-      - Identity = sender + receiver + sent_at
-      - If same identity exists:
-          - If any allowed fields changed -> UPDATE
-          - Else -> count as duplicate (no update)
-      - If not exists -> INSERT
+      - Identity = sender + receiver + email_type + sent_at
+      - If exists:
+          - updates allowed fields if changed
+          - sets updated_at = NOW() only when responds becomes a real response (or changes)
       - Unsubscribe override:
           if email_subscription_preferences.is_subscribed = 0
-          -> Responds='Unsubscribed'
+          -> Responds='Unsubscribed' (and updated_at NOW)
     """
+
     if "file" not in request.files:
         return api_response("Missing file in form-data with key 'file'", 400)
+
+    email_type = (request.form.get("email_type") or "").strip().upper()
+    if email_type not in ["GOLY", "MPLY"]:
+        return api_response("Invalid email_type. Use GOLY or MPLY", 400)
 
     f = request.files["file"]
     if not f or not f.filename:
         return api_response("Empty file", 400)
 
     ext = os.path.splitext(f.filename.lower())[1]
-
     conn = None
     cur = None
 
     try:
-        # --------------------
         # Read file
-        # --------------------
         if ext in [".xlsx", ".xls"]:
             df = pd.read_excel(f, dtype=str)
         elif ext == ".csv":
@@ -159,19 +156,15 @@ def upload_email_send_file():
         df.columns = [normalize_header(c) for c in df.columns]
 
         missing = [h for h in EXPECTED_HEADERS if h not in df.columns]
-        extra = [c for c in df.columns if c not in EXPECTED_HEADERS]
         if missing:
             return api_response(
                 "Invalid file headers",
                 400,
-                {"missing_headers": missing, "extra_headers": extra, "expected": EXPECTED_HEADERS},
+                {"missing_headers": missing, "expected": EXPECTED_HEADERS},
             )
 
         df = df[EXPECTED_HEADERS].copy().fillna("")
 
-        # --------------------
-        # DB connect
-        # --------------------
         conn = get_db_connection()
         cur = conn.cursor(dictionary=True)
 
@@ -181,12 +174,10 @@ def upload_email_send_file():
         duplicates_no_change = 0
         unsubscribed_override_count = 0
 
-        # --------------------
-        # Build candidates + dedupe keys
-        # --------------------
         candidates = []
         dedupe_keys = []
 
+        # Build candidates
         for _, r in df.iterrows():
             sender_email = norm_email(r["Sender Email"])
             receiver_email = norm_email(r["Receiver Email"])
@@ -204,19 +195,18 @@ def upload_email_send_file():
             body = norm_text(r["Body"])
             responds_value = (r["Responds"] or "").strip() or None
 
-            # ✅ Need sent_at for stable dedupe
-            dkey = make_dedupe_key(sender_email, receiver_email, sent_at)
+            dkey = make_dedupe_key(sender_email, receiver_email, sent_at, email_type)
             if not dkey:
                 skipped += 1
                 continue
 
-            # ✅ Unsubscribe override
+            # Unsubscribe override
             cur.execute(
                 """
                 SELECT is_subscribed
                 FROM email_subscription_preferences
-                WHERE LOWER(TRIM(sender_email)) = %s
-                  AND LOWER(TRIM(receiver_email)) = %s
+                WHERE LOWER(TRIM(sender_email))=%s
+                  AND LOWER(TRIM(receiver_email))=%s
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
@@ -227,21 +217,20 @@ def upload_email_send_file():
                 responds_value = "Unsubscribed"
                 unsubscribed_override_count += 1
 
-            candidates.append(
-                {
-                    "dedupe_key": dkey,
-                    "sender_email": sender_email,
-                    "receiver_email": receiver_email,
-                    "first_name": first_name,
-                    "company": company,
-                    "status": status,
-                    "status_message": status_message,
-                    "sent_at": sent_at,
-                    "responds": responds_value,
-                    "subject": subject,
-                    "body": body,
-                }
-            )
+            candidates.append({
+                "dedupe_key": dkey,
+                "sender_email": sender_email,
+                "receiver_email": receiver_email,
+                "email_type": email_type,
+                "first_name": first_name,
+                "company": company,
+                "status": status,
+                "status_message": status_message,
+                "sent_at": sent_at,
+                "responds": responds_value,
+                "subject": subject,
+                "body": body,
+            })
             dedupe_keys.append(dkey)
 
         if not candidates:
@@ -251,18 +240,16 @@ def upload_email_send_file():
                 {"skipped": skipped},
             )
 
-        # --------------------
-        # Fetch existing rows by dedupe_key (chunked)
-        # --------------------
-        existing_map = {}  # dedupe_key -> existing row
+        # Fetch existing rows by dedupe_key
+        existing_map = {}
         CHUNK = 500
-
         for i in range(0, len(dedupe_keys), CHUNK):
-            chunk = dedupe_keys[i : i + CHUNK]
+            chunk = dedupe_keys[i:i+CHUNK]
             placeholders = ",".join(["%s"] * len(chunk))
             cur.execute(
                 f"""
-                SELECT id, dedupe_key, first_name, company, responds, status, status_message, subject, body
+                SELECT id, dedupe_key, first_name, company, status, status_message,
+                       responds, subject, body, updated_at
                 FROM email_send_logs
                 WHERE dedupe_key IN ({placeholders})
                 """,
@@ -271,9 +258,6 @@ def upload_email_send_file():
             for row in cur.fetchall():
                 existing_map[row["dedupe_key"]] = row
 
-        # --------------------
-        # Decide insert vs update vs duplicate(no change)
-        # --------------------
         insert_rows = []
         update_rows = []
 
@@ -283,71 +267,70 @@ def upload_email_send_file():
         for c in candidates:
             ex = existing_map.get(c["dedupe_key"])
 
+            # Decide updated_at for insert
+            insert_updated_at = datetime.now() if is_real_response(c["responds"]) else None
+
             if not ex:
-                insert_rows.append(
-                    (
-                        c["sender_email"],
-                        c["receiver_email"],
-                        c["first_name"],
-                        c["company"],
-                        c["status"],
-                        c["status_message"],
-                        c["sent_at"],
-                        c["responds"],
-                        c["subject"],
-                        c["body"],
-                        c["dedupe_key"],
-                    )
-                )
+                insert_rows.append((
+                    c["sender_email"],
+                    c["receiver_email"],
+                    c["email_type"],
+                    c["first_name"],
+                    c["company"],
+                    c["status"],
+                    c["status_message"],
+                    c["sent_at"],
+                    c["responds"],
+                    insert_updated_at,   # ✅ updated_at
+                    c["subject"],
+                    c["body"],
+                    c["dedupe_key"],
+                ))
                 continue
 
-            # ✅ Allowed updates: responds + subject + body + status + status_message (+ optional first_name/company)
+            # Determine if any changes
             changed = False
-
-            if not same(ex.get("responds"), c["responds"]):
-                changed = True
-            if not same(ex.get("status"), c["status"]):
-                changed = True
-            if not same(ex.get("status_message"), c["status_message"]):
-                changed = True
-            if not same(ex.get("subject"), c["subject"]):
-                changed = True
-            if not same(ex.get("body"), c["body"]):
-                changed = True
-
-            # Optional: also update these if you want
-            if not same(ex.get("first_name"), c["first_name"]):
-                changed = True
-            if not same(ex.get("company"), c["company"]):
-                changed = True
+            for field in ["first_name","company","status","status_message","responds","subject","body"]:
+                if not same(ex.get(field), c.get(field)):
+                    changed = True
+                    break
 
             if not changed:
                 duplicates_no_change += 1
                 continue
 
-            update_rows.append(
-                (
-                    c["first_name"],
-                    c["company"],
-                    c["status"],
-                    c["status_message"],
-                    c["responds"],
-                    c["subject"],
-                    c["body"],
-                    int(ex["id"]),
-                )
-            )
+            # Update updated_at only if responds changed to a real response OR changed value
+            new_responds = c["responds"]
+            old_responds = ex.get("responds")
 
-        # --------------------
+            set_updated_at = None
+            if not same(old_responds, new_responds):
+                # responds changed
+                set_updated_at = datetime.now() if is_real_response(new_responds) else None
+            else:
+                # responds unchanged; keep existing updated_at
+                set_updated_at = ex.get("updated_at")
+
+            update_rows.append((
+                c["first_name"],
+                c["company"],
+                c["status"],
+                c["status_message"],
+                c["responds"],
+                set_updated_at,        # ✅ updated_at
+                c["subject"],
+                c["body"],
+                int(ex["id"]),
+            ))
+
         # Execute DB writes
-        # --------------------
         if insert_rows:
             cur.executemany(
                 """
                 INSERT INTO email_send_logs
-                (sender_email, receiver_email, first_name, company, status, status_message,
-                 sent_at, responds, subject, body, dedupe_key)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                (sender_email, receiver_email, email_type, first_name, company, status, status_message,
+                 sent_at, responds, updated_at, subject, body, dedupe_key)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 insert_rows,
             )
@@ -362,6 +345,7 @@ def upload_email_send_file():
                     status=%s,
                     status_message=%s,
                     responds=%s,
+                    updated_at=%s,
                     subject=%s,
                     body=%s
                 WHERE id=%s
@@ -372,21 +356,17 @@ def upload_email_send_file():
 
         conn.commit()
 
-        return api_response(
-            "Imported successfully",
-            200,
-            {
-                "inserted": inserted,
-                "updated": updated,
-                "duplicates_no_change": duplicates_no_change,
-                "skipped": skipped,
-                "total_rows_in_file": int(len(df)),
-                "unsubscribed_overrides": unsubscribed_override_count,
-            },
-        )
+        return api_response("Imported successfully", 200, {
+            "email_type": email_type,
+            "inserted": inserted,
+            "updated": updated,
+            "duplicates_no_change": duplicates_no_change,
+            "skipped": skipped,
+            "total_rows_in_file": int(len(df)),
+            "unsubscribed_overrides": unsubscribed_override_count,
+        })
 
     except mysql.connector.IntegrityError as ie:
-        # In case unique index exists and concurrent insert happens
         try:
             if conn:
                 conn.rollback()
@@ -414,19 +394,45 @@ def upload_email_send_file():
         except Exception:
             pass
 
+# =========================
+# Report API (Sent / Responds)
+# =========================
+# =========================
+# Report API (Sent / Responds) + Monthly Stats (Current Month Only)
+# =========================
+@email_send_import_bp.route("/report", methods=["POST"])
+def email_report():
+    """
+    POST JSON:
+      {
+        "type": "sent" | "responds",
+        "page": 1,
+        "per_page": 10,
+        "email_type": "GOLY" | "MPLY" | "",
 
-# =========================
-# List API
-# =========================
-@email_send_import_bp.route("/list", methods=["POST"])
-def list_email_logs():
+        "date": "YYYY-MM-DD",                 (optional single date)
+        "date_from": "YYYY-MM-DD",            (optional range)
+        "date_to": "YYYY-MM-DD"
+      }
+
+    Sent tab filters by DATE(sent_at)
+    Responds tab filters by DATE(updated_at) and responds not empty
+    Also returns monthly stats for current month (no date filters applied to monthly except email_type).
+    """
+
     data = request.get_json(silent=True) or {}
 
+    report_type = (data.get("type") or "").lower()
     page = int(data.get("page", 1))
     per_page = int(data.get("per_page", 10))
-    date_val = (data.get("date") or "").strip()  # single date: YYYY-MM-DD
-    sender_email = (data.get("sender_email") or "").strip().lower()
-    receiver_email = (data.get("receiver_email") or "").strip().lower()
+
+    email_type = (data.get("email_type") or "").strip().upper()
+    date = (data.get("date") or "").strip()
+    date_from = (data.get("date_from") or "").strip()
+    date_to = (data.get("date_to") or "").strip()
+
+    if report_type not in ["sent", "responds"]:
+        return api_response("Invalid type. Use 'sent' or 'responds'", 400)
 
     if page < 1:
         page = 1
@@ -445,55 +451,167 @@ def list_email_logs():
         where_clauses = []
         params = []
 
-        if date_val:
-            where_clauses.append("DATE(sent_at) = %s")
-            params.append(date_val)
+        # ✅ Filter by email_type (GOLY/MPLY)
+        if email_type:
+            where_clauses.append("email_type = %s")
+            params.append(email_type)
 
-        if sender_email:
-            where_clauses.append("LOWER(sender_email) = %s")
-            params.append(sender_email)
+        # ----------------------------
+        # SENT TAB
+        # ----------------------------
+        if report_type == "sent":
+            if date:
+                where_clauses.append("DATE(sent_at) = %s")
+                params.append(date)
 
-        if receiver_email:
-            where_clauses.append("LOWER(receiver_email) = %s")
-            params.append(receiver_email)
+            if date_from and date_to:
+                where_clauses.append("DATE(sent_at) BETWEEN %s AND %s")
+                params.extend([date_from, date_to])
 
-        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+            where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
-        count_sql = f"SELECT COUNT(*) AS total FROM email_send_logs {where_sql}"
-        cur.execute(count_sql, params)
-        total_records = int(cur.fetchone()["total"])
+            cur.execute(
+                f"SELECT COUNT(*) AS total FROM email_send_logs {where_sql}",
+                params,
+            )
+            total_records = int(cur.fetchone()["total"])
 
-        data_sql = f"""
-            SELECT *
+            cur.execute(
+                f"""
+                SELECT
+                    sender_email,
+                    receiver_email,
+                    email_type,
+                    subject,
+                    status,
+                    status_message,
+                    sent_at
+                FROM email_send_logs
+                {where_sql}
+                ORDER BY sent_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                params + [per_page, offset],
+            )
+            rows = cur.fetchall()
+
+        # ----------------------------
+        # RESPONDS TAB
+        # ----------------------------
+        else:
+            where_clauses.append("responds IS NOT NULL")
+            where_clauses.append("responds <> ''")
+            where_clauses.append("LOWER(TRIM(responds)) <> 'no response yet'")
+
+            if date:
+                where_clauses.append("DATE(updated_at) = %s")
+                params.append(date)
+
+            if date_from and date_to:
+                where_clauses.append("DATE(updated_at) BETWEEN %s AND %s")
+                params.extend([date_from, date_to])
+
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+            cur.execute(
+                f"SELECT COUNT(*) AS total FROM email_send_logs {where_sql}",
+                params,
+            )
+            total_records = int(cur.fetchone()["total"])
+
+            cur.execute(
+                f"""
+                SELECT
+                    sender_email,
+                    receiver_email,
+                    email_type,
+                    responds,
+                    subject,
+                    body,
+                    updated_at
+                FROM email_send_logs
+                {where_sql}
+                ORDER BY updated_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                params + [per_page, offset],
+            )
+            rows = cur.fetchall()
+
+        # =========================
+        # Monthly Stats (Current Month Only)
+        # =========================
+        monthly_where = []
+        monthly_params = []
+
+        if email_type:
+            monthly_where.append("email_type = %s")
+            monthly_params.append(email_type)
+
+        monthly_where.append("sent_at >= DATE_FORMAT(NOW(), '%Y-%m-01')")
+        monthly_where.append("sent_at <  DATE_ADD(DATE_FORMAT(NOW(), '%Y-%m-01'), INTERVAL 1 MONTH)")
+        monthly_where_sql = "WHERE " + " AND ".join(monthly_where)
+
+        cur.execute(
+            f"""
+            SELECT
+              COUNT(*) AS monthly_sent,
+
+              SUM(CASE
+                    WHEN LOWER(TRIM(responds)) = 'unsubscribed'
+                    THEN 1 ELSE 0
+                  END) AS monthly_unsubscribed,
+
+              SUM(CASE
+                    WHEN responds IS NOT NULL
+                     AND TRIM(responds) <> ''
+                     AND LOWER(TRIM(responds)) <> 'no response yet'
+                     AND LOWER(TRIM(responds)) <> 'unsubscribed'
+                    THEN 1 ELSE 0
+                  END) AS monthly_positive_responds,
+
+              SUM(CASE
+                    WHEN responds IS NULL
+                      OR TRIM(responds) = ''
+                      OR LOWER(TRIM(responds)) = 'no response yet'
+                    THEN 1 ELSE 0
+                  END) AS monthly_not_responds
             FROM email_send_logs
-            {where_sql}
-            ORDER BY id DESC
-            LIMIT %s OFFSET %s
-        """
-        cur.execute(data_sql, params + [per_page, offset])
-        rows = cur.fetchall()
+            {monthly_where_sql}
+            """,
+            monthly_params,
+        )
+        monthly_data = cur.fetchone() or {}
 
         return api_response(
-            "Fetched successfully",
+            f"{report_type.capitalize()} report fetched successfully",
             200,
             {
-                "filters_applied": {
-                    "date": date_val or None,
-                    "sender_email": sender_email or None,
-                    "receiver_email": receiver_email or None,
-                },
+                "type": report_type,
+                "records": rows,
                 "pagination": {
                     "page": page,
                     "per_page": per_page,
                     "total_records": total_records,
                     "total_pages": (total_records + per_page - 1) // per_page,
                 },
-                "records": rows,
+                "filters_applied": {
+                    "email_type": email_type or None,
+                    "date": date or None,
+                    "date_from": date_from or None,
+                    "date_to": date_to or None,
+                },
+                "monthly_stats": {
+                    "monthly_sent": int(monthly_data.get("monthly_sent") or 0),
+                    "monthly_unsubscribed": int(monthly_data.get("monthly_unsubscribed") or 0),
+                    "monthly_positive_responds": int(monthly_data.get("monthly_positive_responds") or 0),
+                    "monthly_not_responds": int(monthly_data.get("monthly_not_responds") or 0),
+                },
             },
         )
 
     except Exception as e:
-        return api_response(f"Fetch failed: {str(e)}", 500)
+        return api_response(f"Report fetch failed: {str(e)}", 500)
 
     finally:
         try:

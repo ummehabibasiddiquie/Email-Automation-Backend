@@ -19,6 +19,10 @@ def get_tracking_db():
         database=Config.TRACK_DB_NAME,
         port=Config.TRACK_DB_PORT,
     )
+    
+def api_response(message, status=200, data=None):
+    return {"message": message, "status": status, "data": data or {}}, status
+
 
 
 def norm_email(val: str) -> str:
@@ -145,44 +149,40 @@ def track_open():
 # =========================================================
 # UNSUBSCRIBE
 # =========================================================
-@email_tracking_bp.route("/unsub", methods=["GET", "POST"])
+# =========================================================
+# UNSUBSCRIBE (POST ONLY)
+# =========================================================
+@email_tracking_bp.route("/unsub", methods=["POST"])
 def unsubscribe():
     """
-    Scanner-safe unsubscribe:
-    - GET: show confirmation page only (no DB write)
-    - POST: perform DB update (real user confirmation)
+    Frontend calls POST with JSON:
+      { "from": "...", "to": "...", "k": "optional" }
+
+    We upsert into email_subscription_preferences:
+      is_subscribed = 0
+      updated_at = NOW
     """
-    ip = _client_ip()
-    ua = request.headers.get("User-Agent", "")
-    method = request.method
 
-    # -----------------------
-    # GET: confirmation page
-    # -----------------------
-    if method == "GET":
-        send_key = (request.args.get("k") or "").strip()
-        receiver = norm_email(request.args.get("to") or request.args.get("email"))
-        sender = norm_email(request.args.get("from") or request.args.get("sender"))
+    payload = request.get_json(silent=True) or {}
 
-        print("[unsub][GET]", "ip=", ip, "ua=", ua, "k=", send_key, "from=", sender, "to=", receiver, flush=True)
+    sender = norm_email(
+        payload.get("from")
+        or payload.get("sender")
+        or request.form.get("from")
+        or request.form.get("sender")
+    )
 
-        if not send_key:
-            return Response("Invalid unsubscribe link (missing k).", status=400, mimetype="text/plain")
+    receiver = norm_email(
+        payload.get("to")
+        or payload.get("email")
+        or request.form.get("to")
+        or request.form.get("email")
+    )
 
-        # IMPORTANT: do NOT update DB on GET
-        return Response(_confirm_page_html(send_key, sender, receiver), mimetype="text/html")
+    send_key = (payload.get("k") or request.form.get("k") or "").strip()  # optional
 
-    # -----------------------
-    # POST: actual unsubscribe
-    # -----------------------
-    send_key = (request.form.get("k") or "").strip()
-    receiver = norm_email(request.form.get("to") or request.form.get("email"))
-    sender = norm_email(request.form.get("from") or request.form.get("sender"))
-
-    print("[unsub][POST]", "ip=", ip, "ua=", ua, "k=", send_key, "from=", sender, "to=", receiver, flush=True)
-
-    if not (sender and receiver):
-        return Response("Invalid unsubscribe request (missing sender/receiver).", status=400, mimetype="text/plain")
+    if not sender or not receiver:
+        return api_response("Missing sender/receiver", 400)
 
     conn = None
     cur = None
@@ -203,16 +203,25 @@ def unsubscribe():
         )
 
         conn.commit()
-        return Response("You have been unsubscribed.", mimetype="text/plain")
+
+        return api_response(
+            "Unsubscribed successfully",
+            200,
+            {
+                "sender_email": sender,
+                "receiver_email": receiver,
+                "is_subscribed": 0,
+                "k": send_key or None,
+            },
+        )
 
     except Exception as e:
-        if conn:
-            try:
+        try:
+            if conn:
                 conn.rollback()
-            except Exception:
-                pass
-        print("[unsub][ERROR]", repr(e), flush=True)
-        return Response("Unsubscribe failed. Please try again later.", status=500, mimetype="text/plain")
+        except Exception:
+            pass
+        return api_response(f"Unsubscribe failed: {str(e)}", 500)
 
     finally:
         try:
