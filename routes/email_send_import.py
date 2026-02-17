@@ -26,7 +26,7 @@ EXPECTED_HEADERS = [
 # DB + helpers
 # =========================
 def get_db_connection():
-    return mysql.connector.connect(
+    conn = mysql.connector.connect(
         host=Config.TRACK_DB_HOST,
         user=Config.TRACK_DB_USER,
         password=Config.TRACK_DB_PASS,
@@ -34,6 +34,14 @@ def get_db_connection():
         port=Config.TRACK_DB_PORT,
         use_pure=True,
     )
+
+    # 🔥 FORCE IST TIMEZONE FOR SESSION
+    cursor = conn.cursor()
+    cursor.execute("SET time_zone = '+05:30'")
+    cursor.close()
+
+    return conn
+
 
 def api_response(message, status=200, data=None):
     return {"message": message, "status": status, "data": data or {}}, status
@@ -494,6 +502,10 @@ def email_report():
                 params + [per_page, offset],
             )
             rows = cur.fetchall()
+            
+            for r in rows:
+                if r.get("updated_at"):
+                    r["updated_at"] = r["updated_at"].strftime("%Y-%m-%d %H:%M:%S")
 
         # ----------------------------
         # RESPONDS TAB
@@ -537,6 +549,10 @@ def email_report():
                 params + [per_page, offset],
             )
             rows = cur.fetchall()
+            
+            for r in rows:
+                if r.get("sent_at"):
+                    r["sent_at"] = r["sent_at"].strftime("%Y-%m-%d %H:%M:%S")
 
         # =========================
         # Monthly Stats (Current Month Only)

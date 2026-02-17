@@ -22,7 +22,10 @@ CORS(app, resources={r"/*": {"origins": ["https://email-automation-dashboard-mao
                                          "https://email-dashboard-goly.vercel.app", 
                                          "https://email-file-goly.vercel.app", 
                                          "https://www.golyyield.com",
-                                         "https://www.mplyetf.com"]}})
+                                         "https://www.mplyetf.com",
+                                         "http://localhost:5173",
+                                         "http://localhost:5174",
+                                         "http://localhost:5175"]}})
 
 
 @app.get("/")
@@ -34,4 +37,4 @@ def root():
 #     return jsonify({"ok": True})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
