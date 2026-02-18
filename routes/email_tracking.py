@@ -19,10 +19,10 @@ def get_tracking_db():
         database=Config.TRACK_DB_NAME,
         port=Config.TRACK_DB_PORT,
     )
-    
+
+
 def api_response(message, status=200, data=None):
     return {"message": message, "status": status, "data": data or {}}, status
-
 
 
 def norm_email(val: str) -> str:
@@ -49,9 +49,17 @@ def _parse_epoch(val):
     except Exception:
         return 0
 
+
 def _esc_html(s: str) -> str:
     # minimal HTML escaping (prevents HTML injection in confirm page)
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
 
 def _client_ip() -> str:
     # if behind nginx, X-Forwarded-For has real IP
@@ -59,6 +67,7 @@ def _client_ip() -> str:
     if xff:
         return xff.split(",")[0].strip()
     return request.remote_addr or ""
+
 
 def _confirm_page_html(send_key: str, sender: str, receiver: str) -> str:
     return f"""<!doctype html>
@@ -102,6 +111,7 @@ def _confirm_page_html(send_key: str, sender: str, receiver: str) -> str:
   </div>
 </body>
 </html>"""
+
 
 # =========================================================
 # OPEN TRACKING
@@ -147,9 +157,6 @@ def track_open():
 
 
 # =========================================================
-# UNSUBSCRIBE
-# =========================================================
-# =========================================================
 # UNSUBSCRIBE (POST ONLY)
 # =========================================================
 @email_tracking_bp.route("/unsub", methods=["POST"])
@@ -161,6 +168,10 @@ def unsubscribe():
     We upsert into email_subscription_preferences:
       is_subscribed = 0
       updated_at = NOW
+
+    ✅ NEW:
+    Also update email_send_logs (NO INSERT, NO DUP ROWS)
+    Set responds='UNSUBSCRIBED' for the latest SENT+NOT_RESPONDED row for sender/receiver
     """
 
     payload = request.get_json(silent=True) or {}
@@ -189,7 +200,9 @@ def unsubscribe():
     try:
         conn = get_tracking_db()
         cur = conn.cursor()
+        now_dt = datetime.now()
 
+        # 1) Upsert subscription preference
         cur.execute(
             """
             INSERT INTO email_subscription_preferences
@@ -199,7 +212,36 @@ def unsubscribe():
               is_subscribed=0,
               updated_at=VALUES(updated_at)
             """,
-            (sender, receiver, datetime.now()),
+            (sender, receiver, now_dt),
+        )
+
+        # 2) Update latest SENT + NOT_RESPONDED log row (no insert)
+        cur.execute(
+            """
+            UPDATE email_send_logs
+            SET responds=%s,
+                status_message=%s,
+                updated_at=%s
+            WHERE id = (
+                SELECT id FROM (
+                    SELECT id
+                    FROM email_send_logs
+                    WHERE sender_email=%s
+                      AND receiver_email=%s
+                      AND status='SENT'
+                      AND (responds IS NULL OR responds='' OR responds='No Response Yet')
+                    ORDER BY sent_at DESC, id DESC
+                    LIMIT 1
+                ) x
+            )
+            """,
+            (
+                "UNSUBSCRIBED",
+                "Receiver unsubscribed via link",
+                now_dt,
+                sender,
+                receiver,
+            ),
         )
 
         conn.commit()
