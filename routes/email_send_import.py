@@ -560,10 +560,7 @@ def email_report():
         # RESPONDS TAB
         # ----------------------------
         else:
-            if not responds_filter: # Default filter for responds tab if no specific filter is given
-                where_clauses.append("responds IS NOT NULL")
-                where_clauses.append("responds <> ''")
-                where_clauses.append("LOWER(TRIM(responds)) <> 'no response yet'")
+            # No default filtering — return all records if no responds_filter
 
             if date:
                 where_clauses.append("DATE(updated_at) = %s")
@@ -573,7 +570,7 @@ def email_report():
                 where_clauses.append("DATE(updated_at) BETWEEN %s AND %s")
                 params.extend([date_from, date_to])
 
-            where_sql = "WHERE " + " AND ".join(where_clauses)
+            where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
             cur.execute(
                 f"SELECT COUNT(*) AS total FROM email_send_logs {where_sql}",
@@ -599,6 +596,7 @@ def email_report():
                 params + [per_page, offset],
             )
             rows = cur.fetchall()
+
             
             for r in rows:
                 if r.get("sent_at"):
