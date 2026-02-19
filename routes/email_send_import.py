@@ -704,6 +704,7 @@ def get_responds_options():
         {"label": "Positive Response"},
         {"label": "Unsubscribed"},
     ]
+    print("Dropdown options for responds filter fetched successfully")
 
     return api_response(
         "Responds options fetched successfully",
