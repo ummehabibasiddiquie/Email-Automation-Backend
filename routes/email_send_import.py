@@ -102,6 +102,14 @@ def is_real_response(responds: str | None) -> bool:
     v = responds.strip().lower()
     return v not in ("", "no response yet")
 
+
+def is_unsubscribe_response(responds: str | None) -> bool:
+    if not responds:
+        return False
+    val = responds.strip().lower()
+    return val in ("unsubscribed", "not interested")
+
+
 # =========================
 # DEDUPE (includes email_type)
 # =========================
@@ -203,6 +211,22 @@ def upload_email_send_file():
             body = norm_text(r["Body"])
             responds_value = (r["Responds"] or "").strip() or None
 
+            # ✅ If reply is "unsubscribed" or "not interested", update subscription
+            if is_unsubscribe_response(responds_value):
+                cur.execute(
+                    """
+                    INSERT INTO email_subscription_preferences
+                      (sender_email, receiver_email, is_subscribed, updated_at)
+                    VALUES (%s, %s, 0, %s)
+                    ON DUPLICATE KEY UPDATE
+                      is_subscribed=0,
+                      updated_at=VALUES(updated_at)
+                    """,
+                    (sender_email, receiver_email, datetime.now()),
+                )
+                unsubscribed_override_count += 1
+                status_message = "Receiver Unsubscribed via mail"
+
             dkey = make_dedupe_key(sender_email, receiver_email, sent_at, email_type)
             if not dkey:
                 skipped += 1
@@ -222,8 +246,11 @@ def upload_email_send_file():
             )
             pref = cur.fetchone()
             if pref and str(pref.get("is_subscribed")) == "0":
+                if not is_unsubscribe_response(responds_value):
+                    unsubscribed_override_count += 1
                 responds_value = "Unsubscribed"
-                unsubscribed_override_count += 1
+                status_message = "Receiver Unsubscribed via mail"
+
 
             candidates.append({
                 "dedupe_key": dkey,
@@ -275,9 +302,7 @@ def upload_email_send_file():
         for c in candidates:
             ex = existing_map.get(c["dedupe_key"])
 
-            # Decide updated_at for insert
-            insert_updated_at = datetime.now() if is_real_response(c["responds"]) else None
-
+            # For new records, always set the updated_at timestamp.
             if not ex:
                 insert_rows.append((
                     c["sender_email"],
@@ -289,35 +314,31 @@ def upload_email_send_file():
                     c["status_message"],
                     c["sent_at"],
                     c["responds"],
-                    insert_updated_at,   # ✅ updated_at
+                    datetime.now(),   # ✅ Always set updated_at for new records
                     c["subject"],
                     c["body"],
                     c["dedupe_key"],
                 ))
                 continue
 
-            # Determine if any changes
+            # Determine if any data fields have changed
             changed = False
             for field in ["first_name","company","status","status_message","responds","subject","body"]:
                 if not same(ex.get(field), c.get(field)):
                     changed = True
                     break
 
-            if not changed:
+            # For existing records, decide whether to update the timestamp
+            set_updated_at = ex.get("updated_at")
+            # A valid date from DB will be a datetime object. An invalid one might be a string '0000-00-00...'.
+            # If there's no valid timestamp, or if the data has changed, update it.
+            if not isinstance(set_updated_at, datetime) or changed:
+                set_updated_at = datetime.now()
+
+            if not changed and isinstance(ex.get("updated_at"), datetime):
+                 # If data hasn't changed and a valid timestamp exists, no need to update.
                 duplicates_no_change += 1
                 continue
-
-            # Update updated_at only if responds changed to a real response OR changed value
-            new_responds = c["responds"]
-            old_responds = ex.get("responds")
-
-            set_updated_at = None
-            if not same(old_responds, new_responds):
-                # responds changed
-                set_updated_at = datetime.now() if is_real_response(new_responds) else None
-            else:
-                # responds unchanged; keep existing updated_at
-                set_updated_at = ex.get("updated_at")
 
             update_rows.append((
                 c["first_name"],
@@ -325,7 +346,7 @@ def upload_email_send_file():
                 c["status"],
                 c["status_message"],
                 c["responds"],
-                set_updated_at,        # ✅ updated_at
+                set_updated_at,        # ✅ Set updated_at if missing or if data changed
                 c["subject"],
                 c["body"],
                 int(ex["id"]),
@@ -438,6 +459,7 @@ def email_report():
     date = (data.get("date") or "").strip()
     date_from = (data.get("date_from") or "").strip()
     date_to = (data.get("date_to") or "").strip()
+    responds_filter = (data.get("responds_filter") or "").strip()
 
     if report_type not in ["sent", "responds"]:
         return api_response("Invalid type. Use 'sent' or 'responds'", 400)
@@ -463,6 +485,32 @@ def email_report():
         if email_type:
             where_clauses.append("email_type = %s")
             params.append(email_type)
+
+        # ✅ Filter by responds_filter
+        # ✅ Filter by responds_filter (ONLY 4 supported values)
+        if responds_filter:
+            rf = responds_filter.strip().lower()
+
+            if rf == "no response yet":
+                where_clauses.append(
+                    "(responds IS NULL OR TRIM(responds) = '' OR LOWER(TRIM(responds)) = 'no response yet')"
+                )
+
+            elif rf == "unsubscribed":
+                where_clauses.append("LOWER(TRIM(responds)) = 'unsubscribed'")
+
+            elif rf == "positive response":
+                where_clauses.append("LOWER(TRIM(responds)) = 'positive response'")
+
+            elif rf == "response":
+                # ✅ ONLY exact 'Response'
+                where_clauses.append("LOWER(TRIM(responds)) = 'response'")
+
+            else:
+                return api_response(
+                    "Invalid responds_filter. Use: No Response Yet | Response | Positive Response | Unsubscribed",
+                    400,
+                )
 
         # ----------------------------
         # SENT TAB
@@ -493,7 +541,8 @@ def email_report():
                     subject,
                     status,
                     status_message,
-                    sent_at
+                    sent_at,
+                    responds
                 FROM email_send_logs
                 {where_sql}
                 ORDER BY sent_at DESC
@@ -511,9 +560,10 @@ def email_report():
         # RESPONDS TAB
         # ----------------------------
         else:
-            where_clauses.append("responds IS NOT NULL")
-            where_clauses.append("responds <> ''")
-            where_clauses.append("LOWER(TRIM(responds)) <> 'no response yet'")
+            if not responds_filter: # Default filter for responds tab if no specific filter is given
+                where_clauses.append("responds IS NOT NULL")
+                where_clauses.append("responds <> ''")
+                where_clauses.append("LOWER(TRIM(responds)) <> 'no response yet'")
 
             if date:
                 where_clauses.append("DATE(updated_at) = %s")
@@ -616,6 +666,7 @@ def email_report():
                     "date": date or None,
                     "date_from": date_from or None,
                     "date_to": date_to or None,
+                    "responds_filter": responds_filter or None,
                 },
                 "monthly_stats": {
                     "monthly_sent": int(monthly_data.get("monthly_sent") or 0),
@@ -640,3 +691,22 @@ def email_report():
                 conn.close()
         except Exception:
             pass
+
+@email_send_import_bp.route("/responds-options", methods=["GET"])
+def get_responds_options():
+    """
+    Returns dropdown options for responds filter
+    """
+
+    options = [
+        {"label": "No Response Yet"},
+        {"label": "Response"},
+        {"label": "Positive Response"},
+        {"label": "Unsubscribed"},
+    ]
+
+    return api_response(
+        "Responds options fetched successfully",
+        200,
+        {"options": options},
+    )
