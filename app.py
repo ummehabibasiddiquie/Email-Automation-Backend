@@ -9,7 +9,7 @@ app = Flask(__name__)
 # IMPORTANT
 app.register_blueprint(email_tracking_bp, url_prefix="/email_tracking")
 app.register_blueprint(email_send_import_bp, url_prefix="/email_send_import")
-
+x
 print("\n==== REGISTERED ROUTES ====")
 for r in app.url_map.iter_rules():
     print(r, r.methods)
@@ -37,4 +37,4 @@ def root():
 #     return jsonify({"ok": True})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5001, debug=True)
