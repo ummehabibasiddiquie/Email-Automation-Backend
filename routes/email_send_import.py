@@ -467,7 +467,9 @@ def email_report():
 
     - Sent tab filters by DATE(sent_at)
     - Responds tab filters by DATE(updated_at)
-    - send_process filters both tabs
+    - send_process filters records only (if provided)
+    - Monthly stats: current month only, returns BOTH Regular + Follow up 1 + Total
+      (monthly stats ignores send_process filter to always show both)
     """
 
     data = request.get_json(silent=True) or {}
@@ -478,7 +480,7 @@ def email_report():
 
     email_type = (data.get("email_type") or "").strip().upper()
 
-    # ✅ Accept only: "Regular" / "Follow up 1" (case-insensitive input)
+    # Accept only: "Regular" / "Follow up 1" (case-insensitive input)
     send_process_raw = (data.get("send_process") or "").strip()
 
     date = (data.get("date") or "").strip()
@@ -511,7 +513,7 @@ def email_report():
             where.append("email_type = %s")
             params.append(email_type)
 
-        # ✅ send_process filter (ONLY Regular / Follow up 1)
+        # ✅ send_process filter for records only
         send_process = ""
         if send_process_raw:
             sp_norm = send_process_raw.lower()
@@ -635,6 +637,72 @@ def email_report():
                 r["sent_at"] = fmt_dt(r.get("sent_at"))
                 r["updated_at"] = fmt_dt(r.get("updated_at"))
 
+        # =========================
+        # Monthly Stats (Current Month Only)
+        # ✅ Always return BOTH Regular + Follow up 1 + Total
+        # ✅ Ignores send_process filter
+        # =========================
+        monthly_base_where = []
+        monthly_base_params = []
+
+        if email_type:
+            monthly_base_where.append("email_type = %s")
+            monthly_base_params.append(email_type)
+
+        monthly_base_where.append("sent_at >= DATE_FORMAT(NOW(), '%Y-%m-01')")
+        monthly_base_where.append("sent_at <  DATE_ADD(DATE_FORMAT(NOW(), '%Y-%m-01'), INTERVAL 1 MONTH)")
+        monthly_base_where_sql = "WHERE " + " AND ".join(monthly_base_where)
+
+        def fetch_monthly_for_process(process_value: str | None):
+            extra_where = []
+            extra_params = []
+            if process_value:
+                extra_where.append("send_process = %s")
+                extra_params.append(process_value)
+
+            where_sql = monthly_base_where_sql + (" AND " + " AND ".join(extra_where) if extra_where else "")
+
+            cur.execute(
+                f"""
+                SELECT
+                  COUNT(*) AS monthly_sent,
+
+                  SUM(CASE
+                        WHEN LOWER(TRIM(responds)) = 'unsubscribed'
+                        THEN 1 ELSE 0
+                      END) AS monthly_unsubscribed,
+
+                  SUM(CASE
+                        WHEN responds IS NOT NULL
+                         AND TRIM(responds) <> ''
+                         AND LOWER(TRIM(responds)) <> 'no response yet'
+                         AND LOWER(TRIM(responds)) <> 'unsubscribed'
+                        THEN 1 ELSE 0
+                      END) AS monthly_positive_responds,
+
+                  SUM(CASE
+                        WHEN responds IS NULL
+                          OR TRIM(responds) = ''
+                          OR LOWER(TRIM(responds)) = 'no response yet'
+                        THEN 1 ELSE 0
+                      END) AS monthly_not_responds
+                FROM email_send_logs
+                {where_sql}
+                """,
+                monthly_base_params + extra_params,
+            )
+            d = cur.fetchone() or {}
+            return {
+                "monthly_sent": int(d.get("monthly_sent") or 0),
+                "monthly_unsubscribed": int(d.get("monthly_unsubscribed") or 0),
+                "monthly_positive_responds": int(d.get("monthly_positive_responds") or 0),
+                "monthly_not_responds": int(d.get("monthly_not_responds") or 0),
+            }
+
+        monthly_regular = fetch_monthly_for_process("Regular")
+        monthly_followup1 = fetch_monthly_for_process("Follow up 1")
+        monthly_total = fetch_monthly_for_process(None)
+
         return api_response(
             f"{report_type.capitalize()} report fetched successfully",
             200,
@@ -654,6 +722,11 @@ def email_report():
                     "date_from": date_from or None,
                     "date_to": date_to or None,
                     "responds_filter": responds_filter or None,
+                },
+                "monthly_stats": {
+                    "regular": monthly_regular,
+                    "follow_up_1": monthly_followup1,
+                    "total": monthly_total,
                 },
             },
         )
