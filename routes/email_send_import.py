@@ -673,10 +673,12 @@ def email_report():
                       END) AS monthly_unsubscribed,
 
                   SUM(CASE
-                        WHEN responds IS NOT NULL
-                         AND TRIM(responds) <> ''
-                         AND LOWER(TRIM(responds)) <> 'no response yet'
-                         AND LOWER(TRIM(responds)) <> 'unsubscribed'
+                        WHEN LOWER(TRIM(responds)) = 'response'
+                        THEN 1 ELSE 0
+                      END) AS monthly_responds,
+
+                  SUM(CASE
+                        WHEN LOWER(TRIM(responds)) = 'positive response'
                         THEN 1 ELSE 0
                       END) AS monthly_positive_responds,
 
@@ -695,6 +697,7 @@ def email_report():
             return {
                 "monthly_sent": int(d.get("monthly_sent") or 0),
                 "monthly_unsubscribed": int(d.get("monthly_unsubscribed") or 0),
+                "monthly_responds": int(d.get("monthly_responds") or 0),
                 "monthly_positive_responds": int(d.get("monthly_positive_responds") or 0),
                 "monthly_not_responds": int(d.get("monthly_not_responds") or 0),
             }
