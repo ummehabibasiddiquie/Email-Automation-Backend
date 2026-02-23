@@ -32,9 +32,9 @@ CORS(app, resources={r"/*": {"origins": ["https://email-automation-dashboard-mao
 def root():
     return jsonify({"service": "email-tracking-backend", "status": "running"})
 
-# @app.get("/health")
-# def health():
-#     return jsonify({"ok": True})
+@app.get("/health")
+def health():
+    return "ok", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
