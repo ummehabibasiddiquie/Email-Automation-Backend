@@ -661,6 +661,7 @@ def email_report():
         monthly_base_where_sql = "WHERE " + " AND ".join(monthly_base_where)
 
         def fetch_monthly_for_process(process_value: str | None):
+            print()
             extra_where = []
             extra_params = []
             if process_value:
