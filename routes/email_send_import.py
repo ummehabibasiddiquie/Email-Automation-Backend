@@ -20,6 +20,7 @@ EXPECTED_HEADERS = [
     "Responds",
     "Subject",
     "Body",
+    "Our Response",
 ]
 
 # =========================
@@ -232,6 +233,7 @@ def upload_email_send_file():
             subject = norm_text(r["Subject"])
             body = norm_text(r["Body"])
             responds_value = (r["Responds"] or "").strip() or None
+            our_response = norm_text(r["Our Response"])
 
             # ✅ If reply is "unsubscribed" or "not interested", update subscription
             if is_unsubscribe_response(responds_value):
@@ -288,6 +290,7 @@ def upload_email_send_file():
                 "responds": responds_value,
                 "subject": subject,
                 "body": body,
+                "our_response": our_response,
             })
             dedupe_keys.append(dkey)
 
@@ -340,12 +343,13 @@ def upload_email_send_file():
                     datetime.now(),
                     c["subject"],
                     c["body"],
+                    c["our_response"],
                     c["dedupe_key"],
                 ))
                 continue
 
             changed = False
-            for field in ["first_name", "company", "status", "status_message", "responds", "subject", "body"]:
+            for field in ["first_name", "company", "status", "status_message", "responds", "subject", "body","our_response"]:
                 if not same(ex.get(field), c.get(field)):
                     changed = True
                     break
@@ -367,6 +371,7 @@ def upload_email_send_file():
                 set_updated_at,
                 c["subject"],
                 c["body"],
+                c["our_response"],
                 int(ex["id"]),
             ))
 
@@ -376,8 +381,8 @@ def upload_email_send_file():
                 """
                 INSERT INTO email_send_logs
                 (sender_email, receiver_email, email_type, send_process, first_name, company, status, status_message,
-                 sent_at, responds, updated_at, subject, body, dedupe_key)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 sent_at, responds, updated_at, subject, body, our_response, dedupe_key)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 insert_rows,
             )
@@ -394,7 +399,8 @@ def upload_email_send_file():
                     responds=%s,
                     updated_at=%s,
                     subject=%s,
-                    body=%s
+                    body=%s,
+                    our_response=%s
                 WHERE id=%s
                 """,
                 update_rows,
@@ -622,6 +628,7 @@ def email_report():
                     responds,
                     subject,
                     body,
+                    our_response,
                     sent_at,
                     updated_at
                 FROM email_send_logs
