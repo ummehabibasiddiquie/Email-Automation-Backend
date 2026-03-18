@@ -130,7 +130,7 @@ def track_open():
     if st_epoch <= 0:
         return _pixel_response()
 
-    if _now_epoch() < (st_epoch + 60):
+    if _now_epoch() < (st_epoch + 600):
         return _pixel_response()
 
     try:
