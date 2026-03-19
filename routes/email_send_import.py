@@ -577,29 +577,42 @@ def email_report():
 
             cur.execute(
                 f"""
-                SELECT
-                    sender_email,
-                    receiver_email,
-                    email_type,
-                    send_process,
-                    subject,
-                    status,
-                    status_message,
-                    sent_at,
-                    responds,
-                    updated_at
-                FROM email_send_logs
-                {where_sql}
-                ORDER BY sent_at DESC
-                LIMIT %s OFFSET %s
+                    SELECT
+                        esl.sender_email,
+                        esl.receiver_email,
+                        esl.email_type,
+                        esl.send_process,
+                        esl.subject,
+                        esl.status,
+                        esl.status_message,
+                        esl.sent_at,
+                        esl.responds,
+                        esl.updated_at,
+
+                        CASE 
+                            WHEN EXISTS (
+                                SELECT 1
+                                FROM email_open_events eoe
+                                WHERE eoe.send_key = esl.dedupe_key
+                                AND eoe.opened_at >= esl.sent_at
+                                AND eoe.opened_at < DATE_ADD(esl.sent_at, INTERVAL 3 DAY)
+                            ) THEN TRUE
+                            ELSE FALSE
+                        END AS is_opened
+
+                    FROM email_send_logs esl
+                    {where_sql}
+                    ORDER BY esl.sent_at DESC
+                    LIMIT %s OFFSET %s
                 """,
                 params + [per_page, offset],
-            )
+)
             rows = cur.fetchall() or []
 
             for r in rows:
                 r["sent_at"] = fmt_dt(r.get("sent_at"))
                 r["updated_at"] = fmt_dt(r.get("updated_at"))
+                r["is_opened"] = bool(r.get("is_opened"))
 
         # ----------------------------
         # RESPONDS TAB
@@ -673,43 +686,73 @@ def email_report():
             cur.execute(
                 f"""
                 SELECT
-                  COUNT(*) AS monthly_sent,
+                COUNT(*) AS monthly_sent,
 
-                  SUM(CASE
+                -- ✅ NEW: opened within 3 days
+                SUM(
+                    CASE 
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM email_open_events eoe
+                        WHERE eoe.send_key = email_send_logs.dedupe_key
+                        AND eoe.opened_at >= email_send_logs.sent_at
+                        AND eoe.opened_at < DATE_ADD(email_send_logs.sent_at, INTERVAL 3 DAY)
+                    )
+                    THEN 1 ELSE 0
+                    END
+                ) AS monthly_opened,
+
+                -- ✅ Optional but recommended
+                SUM(
+                    CASE 
+                    WHEN NOT EXISTS (
+                        SELECT 1
+                        FROM email_open_events eoe
+                        WHERE eoe.send_key = email_send_logs.dedupe_key
+                        AND eoe.opened_at >= email_send_logs.sent_at
+                        AND eoe.opened_at < DATE_ADD(email_send_logs.sent_at, INTERVAL 3 DAY)
+                    )
+                    THEN 1 ELSE 0
+                    END
+                ) AS monthly_not_opened,
+
+                SUM(CASE
                         WHEN LOWER(TRIM(responds)) = 'unsubscribed'
                         THEN 1 ELSE 0
-                      END) AS monthly_unsubscribed,
+                    END) AS monthly_unsubscribed,
 
-                  SUM(CASE
+                SUM(CASE
                         WHEN LOWER(TRIM(responds)) = 'response'
                         THEN 1 ELSE 0
-                      END) AS monthly_responds,
+                    END) AS monthly_responds,
 
-                  SUM(CASE
+                SUM(CASE
                         WHEN LOWER(TRIM(responds)) = 'positive response'
                         THEN 1 ELSE 0
-                      END) AS monthly_positive_responds,
+                    END) AS monthly_positive_responds,
 
-                  SUM(CASE
+                SUM(CASE
                         WHEN responds IS NULL
-                          OR TRIM(responds) = ''
-                          OR LOWER(TRIM(responds)) = 'no response yet'
+                        OR TRIM(responds) = ''
+                        OR LOWER(TRIM(responds)) = 'no response yet'
                         THEN 1 ELSE 0
-                      END) AS monthly_not_responds
+                    END) AS monthly_not_responds
+
                 FROM email_send_logs
-                {where_sql}
+{where_sql}
                 """,
                 monthly_base_params + extra_params,
             )
             d = cur.fetchone() or {}
             return {
                 "monthly_sent": int(d.get("monthly_sent") or 0),
+                "monthly_opened": int(d.get("monthly_opened") or 0),   # ✅ NEW
+                "monthly_not_opened": int(d.get("monthly_not_opened") or 0),  # optional
                 "monthly_unsubscribed": int(d.get("monthly_unsubscribed") or 0),
                 "monthly_responds": int(d.get("monthly_responds") or 0),
                 "monthly_positive_responds": int(d.get("monthly_positive_responds") or 0),
                 "monthly_not_responds": int(d.get("monthly_not_responds") or 0),
             }
-
         monthly_regular = fetch_monthly_for_process("Regular")
         monthly_followup1 = fetch_monthly_for_process("Follow up 1")
         monthly_total = fetch_monthly_for_process(None)
