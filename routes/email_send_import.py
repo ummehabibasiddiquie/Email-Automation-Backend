@@ -593,7 +593,9 @@ def email_report():
                             WHEN EXISTS (
                                 SELECT 1
                                 FROM email_open_events eoe
-                                WHERE eoe.send_key = esl.dedupe_key
+                                WHERE 
+                                LOWER(TRIM(eoe.sender_email)) = LOWER(TRIM(esl.sender_email))
+                                AND LOWER(TRIM(eoe.receiver_email)) = LOWER(TRIM(esl.receiver_email))
                                 AND eoe.opened_at >= esl.sent_at
                                 AND eoe.opened_at < DATE_ADD(esl.sent_at, INTERVAL 3 DAY)
                             ) THEN TRUE
@@ -694,7 +696,9 @@ def email_report():
                     WHEN EXISTS (
                         SELECT 1
                         FROM email_open_events eoe
-                        WHERE eoe.send_key = email_send_logs.dedupe_key
+                        WHERE 
+                        LOWER(TRIM(eoe.sender_email)) = LOWER(TRIM(email_send_logs.sender_email))
+                        AND LOWER(TRIM(eoe.receiver_email)) = LOWER(TRIM(email_send_logs.receiver_email))
                         AND eoe.opened_at >= email_send_logs.sent_at
                         AND eoe.opened_at < DATE_ADD(email_send_logs.sent_at, INTERVAL 3 DAY)
                     )
@@ -708,7 +712,8 @@ def email_report():
                     WHEN NOT EXISTS (
                         SELECT 1
                         FROM email_open_events eoe
-                        WHERE eoe.send_key = email_send_logs.dedupe_key
+                        WHERE LOWER(TRIM(eoe.sender_email)) = LOWER(TRIM(email_send_logs.sender_email))
+                        AND LOWER(TRIM(eoe.receiver_email)) = LOWER(TRIM(email_send_logs.receiver_email))
                         AND eoe.opened_at >= email_send_logs.sent_at
                         AND eoe.opened_at < DATE_ADD(email_send_logs.sent_at, INTERVAL 3 DAY)
                     )
