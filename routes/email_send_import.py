@@ -262,8 +262,8 @@ def upload_email_send_file():
                 """
                 SELECT is_subscribed
                 FROM email_subscription_preferences
-                WHERE LOWER(TRIM(sender_email))=%s
-                  AND LOWER(TRIM(receiver_email))=%s
+                WHERE sender_email=%s
+                AND receiver_email=%s
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
@@ -578,6 +578,7 @@ def email_report():
             cur.execute(
                 f"""
                     SELECT
+                        esl.id,
                         esl.sender_email,
                         esl.receiver_email,
                         esl.email_type,
@@ -590,20 +591,22 @@ def email_report():
                         esl.updated_at,
 
                         CASE 
-                            WHEN EXISTS (
-                                SELECT 1
-                                FROM email_open_events eoe
-                                WHERE 
-                                LOWER(TRIM(eoe.sender_email)) = LOWER(TRIM(esl.sender_email))
-                                AND LOWER(TRIM(eoe.receiver_email)) = LOWER(TRIM(esl.receiver_email))
-                                AND eoe.opened_at >= esl.sent_at
-                                AND eoe.opened_at < DATE_ADD(esl.sent_at, INTERVAL 3 DAY)
-                            ) THEN TRUE
+                            WHEN COUNT(eoe.opened_at) > 0 THEN TRUE
                             ELSE FALSE
                         END AS is_opened
 
                     FROM email_send_logs esl
+
+                    LEFT JOIN email_open_events eoe
+                        ON esl.sender_email = eoe.sender_email
+                        AND esl.receiver_email = eoe.receiver_email
+                        AND eoe.opened_at >= esl.sent_at
+                        AND eoe.opened_at < DATE_ADD(esl.sent_at, INTERVAL 3 DAY)
+
                     {where_sql}
+
+                    GROUP BY esl.id
+
                     ORDER BY esl.sent_at DESC
                     LIMIT %s OFFSET %s
                 """,
@@ -697,8 +700,8 @@ def email_report():
                         SELECT 1
                         FROM email_open_events eoe
                         WHERE 
-                        LOWER(TRIM(eoe.sender_email)) = LOWER(TRIM(email_send_logs.sender_email))
-                        AND LOWER(TRIM(eoe.receiver_email)) = LOWER(TRIM(email_send_logs.receiver_email))
+                        eoe.sender_email = email_send_logs.sender_email
+                        AND eoe.receiver_email = email_send_logs.receiver_email
                         AND eoe.opened_at >= email_send_logs.sent_at
                         AND eoe.opened_at < DATE_ADD(email_send_logs.sent_at, INTERVAL 3 DAY)
                     )
@@ -712,8 +715,8 @@ def email_report():
                     WHEN NOT EXISTS (
                         SELECT 1
                         FROM email_open_events eoe
-                        WHERE LOWER(TRIM(eoe.sender_email)) = LOWER(TRIM(email_send_logs.sender_email))
-                        AND LOWER(TRIM(eoe.receiver_email)) = LOWER(TRIM(email_send_logs.receiver_email))
+                        WHERE eoe.sender_email = email_send_logs.sender_email
+                        AND eoe.receiver_email = email_send_logs.receiver_email
                         AND eoe.opened_at >= email_send_logs.sent_at
                         AND eoe.opened_at < DATE_ADD(email_send_logs.sent_at, INTERVAL 3 DAY)
                     )
